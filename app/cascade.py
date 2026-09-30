@@ -22,6 +22,7 @@ class Candidate:
     important: bool
     specificity: tuple[int, int, int]
     source_order: int
+    rule_index: int  # 规则在请求 rules 数组中的下标（补丁定位用）
     decl_index: int  # 声明在规则块内的下标（同规则同属性后者胜出）
     property: str
     value: str
@@ -47,6 +48,8 @@ class Candidate:
             important=self.important,
             specificity=list(self.specificity),
             source_order=self.source_order,
+            rule_index=self.rule_index,
+            declaration_index=self.decl_index,
             property=self.property,
             value=self.value,
         )

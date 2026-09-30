@@ -11,7 +11,7 @@ docker compose up --build
 
 服务启动后监听 **8000** 端口：
 
-- `POST /compute` — 层叠计算
+- `POST /compute` — 层叠计算；携带 `patches` 时返回样式变更预演（基线 / 补丁后结果、逐项差异、因果轨迹与未生效补丁）
 - `POST /selector-overlap` — 不提供 DOM 样本，判断两条选择器能否命中同一元素
 - `POST /keyframe-sample` — CSS 数值属性关键帧采样
 - `POST /counter-render` — CSS 计数器元素树渲染（counter-reset/set/increment 与 counter()/counters()）
@@ -139,6 +139,124 @@ curl -X POST http://localhost:8000/compute \
   ]
 }
 ```
+
+## POST /compute 样式变更预演（patches）
+
+在原请求上额外携带 `patches` 数组，可对**既有声明**做定位式修改并预演结果。
+每条补丁以 `rule_index`（规则在 `rules` 中的下标）+ `declaration_index`
+（声明在该规则 `declarations` 中的下标）定位，可修改 `value`、`important`
+或 `layer`（三者至少给一个；`layer` 显式给 `null` 表示改为**未分层**，
+缺省表示不改层）。补丁**一次性整体生效**：任一定位非法（下标越界、
+定位重复、未携带任何修改等）整次请求返回 **422，不产生部分结果**。
+
+不带 `patches`（或为空数组）的旧请求与响应完全保持兼容：顶层仍是原有的
+`computed` / `custom_properties` / `invalid` / `evidence` /
+`custom_property_trace`（即基线结果）；携带补丁时额外附带 `preview` 字段。
+
+8000 端口示例（请求体见 `examples/preview.json`）：
+
+```bash
+curl -X POST http://localhost:8000/compute \
+  -H 'Content-Type: application/json' \
+  -d @examples/preview.json
+```
+
+上例在 `examples/request.json` 的基础上打了 4 条补丁：
+
+| 补丁下标 | 定位 | 修改 |
+| --- | --- | --- |
+| 0 | 规则 4 第 0 条（components 层的 important `color: green`） | `important: false` |
+| 1 | 规则 2 第 1 条（`--gap: 8px`） | `value: "12px"` |
+| 2 | 规则 2 第 2 条（`--ring: var(--gap)`） | 追加 fallback：`value: "var(--gap, 2px)"` |
+| 3 | 规则 0 第 1 条（UA 的 `margin: 1em 0`） | `value: "2em 0"` |
+
+```json
+{
+  "preview": {
+    "baseline": {
+      "computed": {"color": "green", "margin": "0", "outline": "8px", "padding": "8px"},
+      "custom_properties": {"--gap": "8px", "--ring": "8px"},
+      "invalid": []
+    },
+    "patched": {
+      "computed": {"color": "red", "margin": "0", "outline": "12px", "padding": "12px"},
+      "custom_properties": {"--gap": "12px", "--ring": "12px"},
+      "invalid": []
+    },
+    "changes": [
+      {"property": "--gap", "is_custom": true, "kind": "edited",
+       "before_status": "ok", "after_status": "ok",
+       "before_value": "8px", "after_value": "12px", "responsible_patches": [{"index": 0, "...": "..."}]},
+      {"property": "--ring", "is_custom": true, "kind": "var_changed",
+       "before_value": "8px", "after_value": "12px", "trail": ["...因果轨迹..."]},
+      {"property": "color", "kind": "winner_changed",
+       "before_value": "green", "after_value": "red",
+       "before_winner": {"rule_index": 4, "declaration_index": 0, "...": "..."},
+       "after_winner": {"rule_index": 3, "declaration_index": 0, "...": "..."}},
+      {"property": "outline", "kind": "var_changed", "before_value": "8px", "after_value": "12px"},
+      {"property": "padding", "kind": "var_changed", "before_value": "8px", "after_value": "12px"}
+    ],
+    "shadowed_patches": [
+      {"patch": {"index": 2, "rule_index": 2, "declaration_index": 2},
+       "reason": "补丁作用的声明在补丁后仍是胜出者，但对它的修改既未改变其胜出地位，也未传导为最终取值变化（--gap 始终有效，追加的 fallback 从未改道）"},
+      {"patch": {"index": 3, "rule_index": 0, "declaration_index": 1},
+       "reason": "声明在层叠竞争中落选（reset 层的 margin: 0 始终胜出），补丁无效"}
+    ],
+    "applied_patches": [{"index": 0, "...": "..."}, {"index": 1, "...": "..."}]
+  }
+}
+```
+
+### 差异分类
+
+`changes[]` **只列出发生变化的普通属性与自定义属性**（未变化的不列出），
+普通属性与自定义属性以 `is_custom` 区分，每项给出基线 / 补丁后的状态与值、
+两侧层叠胜出声明（`before_winner` / `after_winner`）以及 `responsible_patches`
+（对该差异实际负责的补丁下标，留一法判定）。差异 `kind`：
+
+- **`winner_changed`**：层叠胜出声明发生了换人（被改声明自身夺魁，或它被削弱后
+  第三方声明夺魁；`status_changed` 标记是否同时发生 computed ↔ invalid 切换）；
+- **`var_changed`**：胜出声明是**同一条**，但因其 `var()` 依赖的自定义属性
+  变化而改值 / 失效——包括依赖值变化、变量链形成或解除循环、fallback 改道
+  （原本走主分支改为走 fallback，或原本走 fallback 重新走主分支）；
+- **`edited`**：胜出声明是同一条，补丁直接把它自己的 `value` 改为不含
+  `var()` 的字面值（与变量解析无关的直接改值）。
+
+普通属性的 `before_status` / `after_status` 为 `computed` / `invalid`，
+失效原因分别在 `before_reason` / `after_reason`；自定义属性为
+`ok` / `invalid` / `missing`（`missing` 表示该侧元素链上完全没有此变量）。
+纯继承得到、本元素无胜出声明的自定义属性，其 `before_winner` / `after_winner`
+为 `null`。
+
+### 因果轨迹（trail）
+
+每项差异的 `trail[]` 是一条**从被改声明连到最终属性**的中文因果链，沿
+「层叠胜出 → 逐元素自定义属性解析（var 替换 / 循环失效 / fallback 改道）
+→ 继承 → 普通属性取值」传播；发生变化的一跳以 `【基线】…` / `【补丁后】…`
+对照给出，未变化的跳直接叙述。例如把 `--a: 1px` 改为 `--a: var(--b)`、
+同时 `--b: var(--a)` 形成循环后，`padding: var(--a)` 的轨迹为：
+
+```text
+补丁作用于 规则 0 第 0 条声明（--a）：value '1px' → 'var(--b)'
+p 上的自定义属性 --a：该声明在 p 上为 --a 的层叠胜出者
+p 上的自定义属性 --b：【补丁后】p 上 --a ↔ --b 形成循环依赖，相关自定义属性同时失效
+最终普通属性 padding：【基线】var(--a) 直接替换为 '1px'
+最终普通属性 padding：【补丁后】var(--a) 引用的变量因循环依赖而失效且无可用 fallback，声明失效
+```
+
+### 未生效补丁（shadowed_patches）
+
+经留一法判定**未影响结果**的补丁单独列入 `shadowed_patches[]`，并给出原因：
+规则选择器未命中目标元素链、声明在层叠竞争中落选、声明本就胜出但修改不改变
+其胜出地位也不传导到取值（如给始终有效的变量追加 fallback）、或其作用被其他
+补丁完全覆盖。`applied_patches[]` 则回显本次接收的全部补丁（按补丁数组下标）。
+
+### 预演校验（HTTP 422）
+
+- `rule_index` 越界（含负数、非整数、布尔）或 `declaration_index` 超出该规则
+  的声明数；
+- 两条补丁定位到同一条声明；
+- 补丁未携带任何修改（`value` / `important` / `layer` 均缺省）。
 
 ## POST /selector-overlap：选择器可命中性判断
 
@@ -945,6 +1063,7 @@ g/b 为负），需要映射；固定 L=0.7、h=30°、alpha=0.8 二分 15 轮�
 | `layers` | 层声明顺序，按 **早 → 晚**；规则引用未声明的层时按首次出现追加到末尾 |
 | `rules[]` | 结构化规则：`selector`、`declarations[]`、`origin`（`ua`/`user`/`author`，默认 `author`）、`layer`（`null` 表示未分层）、`order`（源码次序，默认取数组下标） |
 | `declarations[]` | `property`、`value`、`important`（默认 `false`） |
+| `patches[]` | 可选，样式变更预演补丁：`rule_index` + `declaration_index` 定位，`value` / `important` / `layer` 至少给一个；任一定位非法整次 422，详见上文 |
 
 ## 选择器支持
 
@@ -968,6 +1087,8 @@ g/b 为负），需要映射；固定 L=0.7、h=30°、alpha=0.8 二分 15 轮�
 
 每条落选声明都会在 `evidence[].eliminated[]` 中给出被淘汰的阶段
 （`importance` / `origin` / `layer` / `specificity` / `source_order`）与中文说明。
+`evidence[].winner` 与每条候选都带 `rule_index` / `declaration_index`，
+即它在请求 `rules` / `declarations` 中的下标，也是 `patches` 的定位依据。
 
 ## 自定义属性与 var()
 
@@ -1004,8 +1125,11 @@ app/
                 固定 L/h/alpha 的最大色域内 C 二分查找
   cascade.py    层叠排序键与淘汰证据生成
   variables.py  var() 解析替换、自定义属性继承与循环检测
-  engine.py     计算编排
+  engine.py     计算编排（_solve 产出带完整轨迹的世界，compute 输出旧版响应）
+  preview.py    样式变更预演：补丁校验 / 基线与补丁后复算 / 留一法归因 /
+                因果依赖图最短路与 shadowed 判定
 tests/test_cascade.py     /compute 端到端测试
+tests/test_preview.py     /compute 样式变更预演（patches）端到端测试
 tests/test_overlap.py     /selector-overlap 端到端测试
 tests/test_keyframe.py    /keyframe-sample 端到端测试
 tests/test_counters.py    /counter-render 端到端测试
@@ -1014,6 +1138,7 @@ tests/test_grid_tracks.py /grid-tracks 端到端测试
 tests/test_color_mix.py   /color-mix 端到端测试
 tests/test_gamut_map.py   /gamut-map 端到端测试
 examples/request.json          /compute 示例请求
+examples/preview.json           /compute 样式变更预演示例请求（携带 patches）
 examples/keyframe-sample.json  /keyframe-sample 示例请求
 examples/counter-render.json   /counter-render 示例请求
 examples/math-evaluate.json    /math-evaluate 示例请求

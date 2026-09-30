@@ -13,6 +13,7 @@ from .math_eval import MathEvaluationError, evaluate_math
 from .models import (
     ColorMixRequest,
     ColorMixResponse,
+    ComputePreviewResponse,
     ComputeRequest,
     ComputeResponse,
     CounterRenderRequest,
@@ -29,6 +30,7 @@ from .models import (
     OverlapResponse,
 )
 from .overlap import selector_overlap
+from .preview import PatchError, compute_with_preview
 from .selector import SelectorSyntaxError
 
 app = FastAPI(
@@ -46,11 +48,22 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/compute", response_model=ComputeResponse)
+@app.post(
+    "/compute",
+    response_model=None,
+    responses={200: {"model": ComputePreviewResponse}},
+)
 def compute_endpoint(req: ComputeRequest) -> ComputeResponse:
+    """层叠计算；请求携带非空 patches 时做样式变更预演，在基线结果之外另附
+    preview（基线 / 补丁后快照、逐项差异、因果轨迹与未生效补丁）。
+    补丁任一定位非法则整次请求 422，不产生部分结果。"""
     try:
+        if req.patches:
+            return compute_with_preview(req)
         return compute(req)
     except SelectorSyntaxError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except PatchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

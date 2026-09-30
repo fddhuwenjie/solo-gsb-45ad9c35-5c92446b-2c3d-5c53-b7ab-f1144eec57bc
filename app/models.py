@@ -38,6 +38,51 @@ class ComputeRequest(BaseModel):
     ancestors: list[ElementInfo] = Field(default_factory=list)
     layers: list[str] = Field(default_factory=list)  # 层声明顺序：早 -> 晚
     rules: list[Rule] = Field(default_factory=list)
+    # 样式变更预演补丁：按 (rule_index, declaration_index) 定位到 rules 中某条
+    # 规则块内的某条声明，可改 value / important / layer（layer 显式给 null
+    # 表示把声明改为未分层）。补丁一次性整体生效：任一定位非法即整次 422。
+    patches: list["DeclarationPatch"] = Field(default_factory=list)
+
+
+class DeclarationPatch(BaseModel):
+    """对一条既有声明的定位式修改。
+
+    rule_index 为规则在请求 rules 数组中的下标，declaration_index 为声明在
+    该规则 declarations 中的下标。value / important / layer 至少给一个；
+    layer 缺省表示不改层，显式 null 表示改为未分层。
+    """
+
+    rule_index: int
+    declaration_index: int
+    value: Optional[str] = None
+    important: Optional[bool] = None
+    layer: Optional[str] = None
+
+    @field_validator("rule_index", "declaration_index", mode="before")
+    @classmethod
+    def _reject_non_int(cls, v):
+        # 与其它端点的下标字段同理：布尔 / 浮点不能混作下标
+        if isinstance(v, bool) or isinstance(v, float):
+            raise ValueError("补丁下标必须为非负整数")
+        return v
+
+    @field_validator("value")
+    @classmethod
+    def _value_not_null(cls, v):
+        # 缺省 value 表示不改；显式 null 不允许（补丁不能删除声明的值）
+        if v is None:
+            raise ValueError("value 不能为 null；不修改 value 时省略该字段")
+        return v
+
+    @field_validator("important")
+    @classmethod
+    def _important_not_null(cls, v):
+        if v is None:
+            raise ValueError("important 不能为 null；只能给 true / false，不修改时省略")
+        return v
+
+    def layer_explicitly_set(self) -> bool:
+        return "layer" in self.model_fields_set
 
 
 # ---------- 响应 ----------
@@ -52,6 +97,8 @@ class CandidateOut(BaseModel):
     important: bool
     specificity: list[int]
     source_order: int
+    rule_index: int  # 规则在请求 rules 数组中的下标（补丁定位用）
+    declaration_index: int  # 声明在规则 declarations 中的下标（补丁定位用）
     property: str
     value: str
 
@@ -100,6 +147,78 @@ class ComputeResponse(BaseModel):
     invalid: list[InvalidDeclOut]
     evidence: list[PropertyEvidenceOut]
     custom_property_trace: list[CustomPropTraceOut]
+
+
+# ---------- 样式变更预演（POST /compute 携带 patches 时） ----------
+
+
+class PatchRefOut(BaseModel):
+    """对一条补丁的回显与定位。"""
+
+    index: int  # 补丁在请求 patches 数组中的下标
+    rule_index: int
+    declaration_index: int
+
+
+class PreviewSnapshotOut(BaseModel):
+    """一个世界（基线或补丁后）的目标元素计算快照。"""
+
+    computed: dict[str, Optional[str]]
+    custom_properties: dict[str, str]
+    invalid: list[InvalidDeclOut]
+
+
+class PropertyChangeOut(BaseModel):
+    """一项发生变化的普通属性或自定义属性。
+
+    kind：
+      - winner_changed：层叠胜出声明换了（含被改声明自身夺魁 / 失魁）；
+      - var_changed：胜出声明是同一条，因其 var() 依赖的自定义属性
+        （值 / 循环 / fallback 走向）变化而改值；
+      - edited：胜出声明是同一条，补丁直接修改了它自己的 value；
+    status_changed 标记 computed ↔ invalid 状态切换（可与任一 kind 并存）。
+    对自定义属性，before_winner 仅在目标元素本就有该属性的胜出声明时非空
+    （纯继承得到的自定义属性无本元素 winner）。
+    """
+
+    property: str
+    kind: Literal["winner_changed", "var_changed", "edited"]
+    is_custom: bool
+    status_changed: bool
+    before_status: str  # 普通属性 computed | invalid；自定义属性 ok | missing
+    after_status: str
+    before_value: Optional[str]
+    after_value: Optional[str]
+    before_winner: Optional[CandidateOut] = None
+    after_winner: Optional[CandidateOut] = None
+    before_reason: Optional[str] = None
+    after_reason: Optional[str] = None
+    responsible_patches: list[PatchRefOut] = Field(default_factory=list)
+    trail: list[str] = Field(default_factory=list)  # 因果轨迹：被改声明 -> 最终属性
+
+
+class ShadowedPatchOut(BaseModel):
+    """未影响最终结果的补丁（其所在位置的声明在补丁前后都不决定任何结果，
+    或移除该补丁后目标元素结果与全量补丁一致）。"""
+
+    patch: PatchRefOut
+    reason: str
+
+
+class ComputePreview(BaseModel):
+    """预演结果：基线与补丁后快照、逐项差异与未生效补丁。"""
+
+    baseline: PreviewSnapshotOut
+    patched: PreviewSnapshotOut
+    changes: list[PropertyChangeOut]
+    shadowed_patches: list[ShadowedPatchOut] = Field(default_factory=list)
+    applied_patches: list[PatchRefOut] = Field(default_factory=list)
+
+
+class ComputePreviewResponse(ComputeResponse):
+    """携带 patches 时的响应：在原有字段（等于基线结果）之外另附 preview。"""
+
+    preview: ComputePreview
 
 
 # ---------- POST /selector-overlap ----------
