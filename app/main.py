@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 
 from .engine import compute
+from .engine import PatchError
 from .color_mix import ColorMixError, mix_colors
 from .counters import CounterRenderError, render_counter_tree
 from .gamut_map import GamutMapError, gamut_map
@@ -15,6 +16,7 @@ from .models import (
     ColorMixResponse,
     ComputeRequest,
     ComputeResponse,
+    PreviewComputeResponse,
     CounterRenderRequest,
     CounterRenderResponse,
     GamutMapRequest,
@@ -46,11 +48,13 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/compute", response_model=ComputeResponse)
-def compute_endpoint(req: ComputeRequest) -> ComputeResponse:
+@app.post("/compute", response_model=ComputeResponse | PreviewComputeResponse)
+def compute_endpoint(
+    req: ComputeRequest,
+) -> ComputeResponse | PreviewComputeResponse:
     try:
         return compute(req)
-    except SelectorSyntaxError as exc:
+    except (SelectorSyntaxError, PatchError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

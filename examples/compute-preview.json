@@ -1,0 +1,36 @@
+{
+  "element": {"tag": "p", "classes": ["text"]},
+  "ancestors": [{"tag": "body", "classes": ["dark"]}],
+  "layers": ["reset", "theme", "components"],
+  "rules": [
+    {"origin": "ua", "selector": "p", "declarations": [
+      {"property": "color", "value": "black"},
+      {"property": "margin", "value": "1em 0"}
+    ]},
+    {"origin": "author", "layer": "reset", "selector": "p", "declarations": [
+      {"property": "margin", "value": "0"}
+    ]},
+    {"origin": "author", "layer": "theme", "selector": "body", "declarations": [
+      {"property": "--tone", "value": "blue"}
+    ]},
+    {"origin": "author", "layer": "theme", "selector": "p", "declarations": [
+      {"property": "--gap", "value": "8px"}
+    ]},
+    {"origin": "author", "selector": ".text", "declarations": [
+      {"property": "color", "value": "red"}
+    ]},
+    {"origin": "author", "layer": "components", "selector": "p", "declarations": [
+      {"property": "color", "value": "green"}
+    ]},
+    {"origin": "author", "selector": "p", "declarations": [
+      {"property": "padding", "value": "var(--gap, 4px)"},
+      {"property": "outline-color", "value": "var(--tone, red)"}
+    ]}
+  ],
+  "patches": [
+    {"rule_index": 3, "declaration_index": 0, "value": "16px"},
+    {"rule_index": 2, "declaration_index": 0, "value": "navy"},
+    {"rule_index": 4, "declaration_index": 0, "layer": "reset"},
+    {"rule_index": 0, "declaration_index": 0, "value": "silver"}
+  ]
+}

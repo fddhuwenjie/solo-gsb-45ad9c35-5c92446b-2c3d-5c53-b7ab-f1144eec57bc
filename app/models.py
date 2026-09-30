@@ -33,11 +33,55 @@ class Rule(BaseModel):
     order: Optional[int] = None  # 源码次序，缺省取规则在数组中的下标
 
 
+class StylePatch(BaseModel):
+    """对一条既有声明的临时修改，按 rules 下标 rule_index 与该规则
+    declarations 内的下标 declaration_index 定位。
+
+    value / important / layer 至少给出一项；未给出的字段保持原值；
+    layer 显式给 null 表示把该声明改为未分层（与「不给字段」相区别）。
+    补丁只在本次预演中生效，不修改请求本身。
+    """
+
+    rule_index: int
+    declaration_index: int
+    value: Optional[str] = None
+    important: Optional[bool] = None
+    layer: Optional[str] = None
+
+    @field_validator("rule_index", "declaration_index", mode="before")
+    @classmethod
+    def _reject_non_int(cls, v):
+        # 与计数器操作值同理：布尔 / 浮点不能并入下标整数
+        if isinstance(v, bool) or isinstance(v, float):
+            raise ValueError("规则 / 声明下标必须为非负整数")
+        return v
+
+    @field_validator("important", mode="before")
+    @classmethod
+    def _reject_non_bool(cls, v):
+        # Pydantic 默认会把 "yes" 等字符串归并成布尔，预演补丁要求显式布尔
+        if v is not None and not isinstance(v, bool):
+            raise ValueError("important 必须为布尔值 true / false")
+        return v
+
+    @property
+    def sets_layer(self) -> bool:
+        return "layer" in self.model_fields_set
+
+    def at_least_one_change(self) -> bool:
+        return (
+            "value" in self.model_fields_set
+            or "important" in self.model_fields_set
+            or "layer" in self.model_fields_set
+        )
+
+
 class ComputeRequest(BaseModel):
     element: ElementInfo
     ancestors: list[ElementInfo] = Field(default_factory=list)
     layers: list[str] = Field(default_factory=list)  # 层声明顺序：早 -> 晚
     rules: list[Rule] = Field(default_factory=list)
+    patches: list[StylePatch] = Field(default_factory=list)  # 样式变更预演补丁
 
 
 # ---------- 响应 ----------
@@ -100,6 +144,101 @@ class ComputeResponse(BaseModel):
     invalid: list[InvalidDeclOut]
     evidence: list[PropertyEvidenceOut]
     custom_property_trace: list[CustomPropTraceOut]
+
+
+class PreviewComputeResponse(ComputeResponse):
+    """携带 patches 时的顶层响应：在基线响应之外附加 preview。
+    preview 内嵌套的 baseline / patched 仍是不带 preview 的 ComputeResponse，
+    旧请求（无 patches）的响应也仍是 ComputeResponse，键集合保持兼容。"""
+
+    preview: "StylePreviewOut"
+
+
+# ---------- 样式变更预演（patches） ----------
+
+
+class CausalStepOut(BaseModel):
+    """因果轨迹上的一步：从被改声明出发，经变量依赖到最终属性。
+
+    kind:
+      - patch：被修改的声明本身（轨迹起点，附修改说明）；
+      - cascade：无变量链时，层叠胜出者直接易主；
+      - var：var() 引用状态正常的变量并取值；
+      - fallback：引用的变量缺失 / 失效，声明改走 fallback；
+      - failed：引用缺失 / 失效且无 fallback，声明随之失效；
+      - cycle：引用使变量链进入（或解除）循环；
+      - result：最终属性的状态 / 取值（轨迹终点）。
+    """
+
+    kind: str
+    element: str
+    property: str
+    detail: str
+
+
+class PropertyDiffOut(BaseModel):
+    """一个普通属性在补丁前后的差异。
+
+    diff_type:
+      - winner_change：层叠胜出声明发生变化（含胜出声明因 important / layer
+        变化而易主）；
+      - value_edit：胜出声明未变，补丁直接修改了它的 value；
+      - var_value_change：胜出声明未变、自身 value 未改，因 var() 依赖链
+        上的自定义属性变化而改值；
+      - status_switch：computed ↔ invalid 状态切换
+      （可能同时伴随胜出者变化，winner 信息一并给出）。
+    """
+
+    property: str
+    diff_type: str
+    baseline_status: str  # computed | invalid
+    patched_status: str
+    baseline_value: Optional[str]
+    patched_value: Optional[str]
+    baseline_winner: Optional[CandidateOut] = None
+    patched_winner: Optional[CandidateOut] = None
+    causal_paths: list[list[CausalStepOut]] = Field(default_factory=list)
+    note: str = ""
+
+
+class CustomPropertyDiffOut(BaseModel):
+    """目标元素上一个自定义属性（--*）在补丁前后的差异。
+
+    diff_type 同普通属性：winner_change / value_edit / var_value_change /
+    status_switch；自定义属性的 var_value_change 覆盖循环形成 / 解除导致的
+    取值变化。element 为差异落点元素（祖先改动经继承影响目标时仍是目标）。
+    """
+
+    property: str
+    element: str
+    diff_type: str
+    baseline_status: str  # ok | invalid
+    patched_status: str
+    baseline_value: Optional[str]
+    patched_value: Optional[str]
+    baseline_winner: Optional[CandidateOut] = None
+    patched_winner: Optional[CandidateOut] = None
+    causal_paths: list[list[CausalStepOut]] = Field(default_factory=list)
+    note: str = ""
+
+
+class ShadowedPatchOut(BaseModel):
+    """未对结果产生任何影响的补丁：要么声明在层叠中本就落选（改了也轮不到
+    它胜出），要么胜出声明的改动未传导到任何属性差异。"""
+
+    rule_index: int
+    declaration_index: int
+    property: str
+    changes: dict[str, object]
+    reason: str
+
+
+class StylePreviewOut(BaseModel):
+    baseline: ComputeResponse
+    patched: ComputeResponse
+    property_diffs: list[PropertyDiffOut]
+    custom_property_diffs: list[CustomPropertyDiffOut]
+    shadowed_patches: list[ShadowedPatchOut]
 
 
 # ---------- POST /selector-overlap ----------

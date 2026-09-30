@@ -25,6 +25,7 @@ class Candidate:
     decl_index: int  # 声明在规则块内的下标（同规则同属性后者胜出）
     property: str
     value: str
+    rule_index: int = 0  # 规则在 rules 数组中的下标（样式预演定位用）
 
     def sort_key(self):
         """返回可比较的元组，越大优先级越高。"""

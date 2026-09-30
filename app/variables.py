@@ -61,8 +61,17 @@ def parse_var_call(text: str, start: int) -> tuple[str, str | None, int]:
     raise VarSyntaxError("var() 参数列表格式错误")
 
 
-def substitute_vars(text: str, lookup, steps: list[str] | None = None) -> str:
-    """把 text 中的 var() 全部替换为 lookup 给出的值，失败抛 Unresolvable。"""
+def substitute_vars(
+    text: str,
+    lookup,
+    steps: list[str] | None = None,
+    on_query=None,
+) -> str:
+    """把 text 中的 var() 全部替换为 lookup 给出的值，失败抛 Unresolvable。
+
+    on_query(name, status, used_fallback) 在每次 var() 决断后回调（含 fallback
+    内部嵌套的 var()），用于样式预演记录变量依赖与 fallback 改道。
+    """
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -70,19 +79,27 @@ def substitute_vars(text: str, lookup, steps: list[str] | None = None) -> str:
             try:
                 name, fallback, end = parse_var_call(text, i)
             except VarSyntaxError as exc:
+                if on_query is not None:
+                    on_query("<syntax>", "syntax", False)
                 raise Unresolvable("<syntax>", "syntax") from exc
             status, value = lookup(name)
             if status == "ok":
                 if steps is not None:
                     steps.append(f"var({name}) → {value!r}")
+                if on_query is not None:
+                    on_query(name, "ok", False)
                 out.append(value)
             elif fallback is not None:
-                sub = substitute_vars(fallback, lookup, steps)
+                sub = substitute_vars(fallback, lookup, steps, on_query)
                 if steps is not None:
                     reason = "未定义" if status == "missing" else "已失效"
                     steps.append(f"var({name}) 引用的变量{reason}，使用 fallback → {sub!r}")
+                if on_query is not None:
+                    on_query(name, status, True)
                 out.append(sub)
             else:
+                if on_query is not None:
+                    on_query(name, status, False)
                 raise Unresolvable(name, status)
             i = end
         else:
@@ -186,3 +203,106 @@ def resolve_custom_properties(
         if status == "invalid":
             notes[name] = "var() 解析失败：引用的自定义属性缺失或已失效，且无 fallback"
     return resolved, notes
+
+
+# ---------- 带依赖记录的自定义属性解析（样式预演使用） ----------
+
+
+class Query:
+    """一次 var() 决断的依赖记录：引用的变量名、被引用变量的状态、
+    是否使用了 fallback、该引用由哪条本元素声明（属性名）发起。"""
+
+    __slots__ = ("name", "status", "fallback", "from_prop")
+
+    def __init__(self, name: str, status: str, fallback: bool, from_prop: str):
+        self.name = name
+        self.status = status
+        self.fallback = fallback
+        self.from_prop = from_prop
+
+
+def resolve_custom_properties_traced(
+    own: dict[str, str],
+    inherited: dict[str, tuple[str, str | None]],
+) -> tuple[
+    dict[str, tuple[str, str | None]],
+    dict[str, str],
+    set[str],
+    list[Query],
+    dict[str, str | None],
+]:
+    """resolve_custom_properties 的等价实现，额外返回预演所需的依赖信息。
+
+    返回 (resolved, notes, cyclic, queries, resolved_value)：
+      - resolved / notes / cyclic 与原函数语义一致（cyclic 为失效变量集合）；
+      - queries 按发生顺序记录全部 var() 决断（含循环变量声明上的引用，
+        此时其发起声明本身失效、未做替换，status 表示被引用变量当时的状态）；
+      - resolved_value 给出每个本元素声明最终解析出的值（无效为 None；
+        循环变量同样为 None）。
+    """
+    deps = {name: extract_var_names(value) for name, value in own.items()}
+    cyclic = find_cyclic(deps)
+
+    resolved: dict[str, tuple[str, str | None]] = dict(inherited)
+    notes: dict[str, str] = {}
+    queries: list[Query] = []
+    values: dict[str, str | None] = {}
+    if cyclic:
+        note = "循环依赖失效：" + " ↔ ".join(sorted(cyclic))
+        for name in cyclic:
+            resolved[name] = ("invalid", None)
+            values[name] = None
+            notes[name] = note
+
+    memo: dict[str, tuple[str, str | None]] = {}
+    stack: list[str] = []
+
+    def provider(name: str) -> tuple[str, str | None]:
+        if name in resolved:
+            return resolved[name]
+        if name in own:
+            return resolve_own(name)
+        return ("missing", None)
+
+    def on_query(qname: str, status: str, used_fallback: bool) -> None:
+        queries.append(Query(qname, status, used_fallback, stack[-1] if stack else ""))
+
+    def lookup(name: str) -> tuple[str, str | None]:
+        if name in resolved:
+            return resolved[name]
+        if name in own:
+            return resolve_own(name)
+        return ("missing", None)
+
+    def resolve_own(name: str) -> tuple[str, str | None]:
+        if name in memo:
+            return memo[name]
+        stack.append(name)
+        try:
+            try:
+                memo[name] = ("ok", substitute_vars(own[name], lookup, None, on_query))
+            except Unresolvable:
+                memo[name] = ("invalid", None)
+        finally:
+            stack.pop()
+        return memo[name]
+
+    # 循环变量不做替换，但其 var() 引用仍要记录以串起因果轨迹
+    for name in cyclic:
+        stack.append(name)
+        try:
+            for ref in deps[name]:
+                status = provider(ref)[0]
+                queries.append(Query(ref, status, False, name))
+        finally:
+            stack.pop()
+
+    for name in own:
+        if name in cyclic:
+            continue
+        status, value = resolve_own(name)
+        resolved[name] = (status, value)
+        values[name] = value if status == "ok" else None
+        if status == "invalid":
+            notes[name] = "var() 解析失败：引用的自定义属性缺失或已失效，且无 fallback"
+    return resolved, notes, cyclic, queries, values
